@@ -13,6 +13,23 @@ Sophus 链接兼容和 RViz 显示优化，可直接配合
 [`ashduwihch/mid360_gazebo_harmonic`](https://github.com/ashduwihch/mid360_gazebo_harmonic)
 使用。
 
+## 与 MID-360 Gazebo 插件配合
+
+推荐启动顺序：
+
+1. 启动 Gazebo、PX4 和 MID-360；
+2. 确认 `/livox/lidar` 与 `/livox/imu` 正常发布；
+3. 启动 `fastlio2 lio_launch.py`，或直接启动带回环的 `pgo pgo_launch.py`。
+
+检查传感器话题：
+
+```bash
+ros2 topic type /livox/lidar
+ros2 topic type /livox/imu
+ros2 topic hz /livox/lidar
+ros2 topic hz /livox/imu
+```
+
 ## 本版本修改
 
 ### 1. 修正 ROS 2 IMU 加速度单位
@@ -161,6 +178,17 @@ source ~/livox_ws/install/setup.bash
 source ~/fastlio2_pgo_ws/install/setup.bash
 ```
 
+编译全部完成后，可执行下面的指令将它们加入 `~/.bashrc`。这组指令只需执行一次：
+
+```bash
+echo 'source /opt/ros/humble/setup.bash' >> ~/.bashrc
+echo 'source ~/livox_ws/install/setup.bash' >> ~/.bashrc
+echo 'source ~/fastlio2_pgo_ws/install/setup.bash' >> ~/.bashrc
+source ~/.bashrc
+```
+
+以后新开终端时会自动加载，不需要再次手动执行 `source`。
+
 ## 输入话题
 
 默认配置文件：
@@ -241,23 +269,6 @@ ros2 service call /hba/refine_map interface/srv/RefineMap \
 ```
 
 使用 HBA 时，保存地图需设置 `save_patches: true`。
-
-## 与 MID-360 Gazebo 插件配合
-
-推荐启动顺序：
-
-1. 启动 Gazebo、PX4 和 MID-360；
-2. 确认 `/livox/lidar` 与 `/livox/imu` 正常发布；
-3. 启动 `fastlio2 lio_launch.py`，或直接启动带回环的 `pgo pgo_launch.py`。
-
-检查传感器话题：
-
-```bash
-ros2 topic type /livox/lidar
-ros2 topic type /livox/imu
-ros2 topic hz /livox/lidar
-ros2 topic hz /livox/imu
-```
 
 ## 项目来源与致谢
 
