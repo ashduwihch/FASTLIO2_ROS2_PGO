@@ -122,7 +122,8 @@ public:
             RCLCPP_WARN(this->get_logger(), "IMU Message is out of order");
             std::deque<IMUData>().swap(m_state_data.imu_buffer);
         }
-        m_state_data.imu_buffer.emplace_back(V3D(msg->linear_acceleration.x, msg->linear_acceleration.y, msg->linear_acceleration.z) * 10.0,
+        // sensor_msgs/Imu linear acceleration is already expressed in m/s^2.
+        m_state_data.imu_buffer.emplace_back(V3D(msg->linear_acceleration.x, msg->linear_acceleration.y, msg->linear_acceleration.z),
                                              V3D(msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z),
                                              timestamp);
         m_state_data.last_imu_time = timestamp;
@@ -130,6 +131,11 @@ public:
     void lidarCB(const livox_ros_driver2::msg::CustomMsg::SharedPtr msg)
     {
         CloudType::Ptr cloud = Utils::livox2PCL(msg, m_builder_config.lidar_filter_num, m_builder_config.lidar_min_range, m_builder_config.lidar_max_range);
+        // Gazebo may publish an empty scan while the simulated lidar is starting.
+        // PCL's transformPointCloud cannot handle a non-organized cloud whose
+        // width is zero, so ignore the scan before it reaches map initialization.
+        if (cloud->empty())
+            return;
         std::lock_guard<std::mutex> lock(m_state_data.lidar_mutex);
         double timestamp = Utils::getSec(msg->header);
         if (timestamp < m_state_data.last_lidar_time)

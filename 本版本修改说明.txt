@@ -1,0 +1,45 @@
+FASTLIO2 ROS 2 PGO 仿真适配版修改说明
+
+项目来源：
+https://github.com/liangheming/FASTLIO2_ROS2
+
+本版本主要针对 Ubuntu 22.04、ROS 2 Humble、Gazebo Harmonic 和仿真 MID-360
+数据链路进行了以下修改。
+
+一、修正 IMU 加速度单位
+
+ROS 2 的 sensor_msgs/msg/Imu 已使用 m/s² 表示线加速度。原代码在接收数据后
+又乘以 10.0，会导致重力和运动加速度被放大十倍。当前版本删除了这次额外缩放，
+避免姿态估计、坐标轴和点云出现异常漂移。
+
+修改文件：fastlio2/src/lio_node.cpp
+
+二、增加空点云保护
+
+Gazebo 启动、暂停、场景切换或当前扫描没有有效命中时，可能发布 point_num 为 0
+的空点云。原程序将空点云继续交给 PCL 后，可能因点云宽度为 0 触发除零异常，
+表现为 lio_node 以 exit code -8 退出。
+
+当前版本会在点云进入缓存和地图初始化前检查 cloud->empty()，空帧直接忽略，
+正常点云处理流程不变。
+
+修改文件：fastlio2/src/lio_node.cpp
+
+三、补充 Sophus 链接
+
+在 fastlio2 的 CMake 配置中显式链接 Sophus::Sophus，解决部分环境下头文件可以
+找到、但最终链接不完整的问题。该修改不影响 FAST-LIO2 算法。
+
+修改文件：fastlio2/CMakeLists.txt
+
+四、调整 PGO 的 RViz 默认显示
+
+累计 world_cloud 长时间显示时会不断增加 RViz 的渲染负担。当前配置默认关闭
+world_cloud 和路径显示，并增加 /fastlio2/lio_odom 里程计箭头。用户仍可在
+RViz 中按需重新启用世界点云和路径。
+
+修改文件：pgo/rviz/pgo.rviz
+
+以上修改不改变 FAST-LIO2 的点云匹配、IESKF、PGO 回环检测、GTSAM 位姿图优化、
+重定位或 HBA 算法逻辑。
+
