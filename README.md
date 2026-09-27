@@ -17,7 +17,13 @@ Sophus 链接兼容和 RViz 显示优化，可直接配合
 
 推荐启动顺序：
 
-1. 启动 Gazebo、PX4 和 MID-360；
+1. 使用 `mid360_posix_sitl.launch.py` 启动 Gazebo、PX4 和 MID-360：
+
+   ```bash
+   cd ~/PX4-Autopilot/launch
+   ros2 launch ./mid360_posix_sitl.launch.py
+   ```
+
 2. 确认 `/livox/lidar` 与 `/livox/imu` 正常发布；
 3. 启动 `fastlio2 lio_launch.py`，或直接启动带回环的 `pgo pgo_launch.py`。
 
