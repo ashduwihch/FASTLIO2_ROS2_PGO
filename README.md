@@ -52,7 +52,83 @@ Sophus 链接问题。该修改不改变算法。
 本项目使用 Livox `CustomMsg` 接收 MID-360 点云，因此编译前必须确保
 `livox_ros_driver2` 已安装并能被当前 ROS 2 环境找到。
 
-## 创建工作空间并下载
+下面按照从一台已安装 ROS 2 Humble 的 Ubuntu 22.04 电脑开始，依次安装全部关键依赖。
+
+## 1. 安装基础编译依赖
+
+```bash
+sudo apt update
+sudo apt install -y build-essential cmake git python3-colcon-common-extensions \
+  libpcl-dev libeigen3-dev libyaml-cpp-dev libboost-all-dev libtbb-dev \
+  ros-humble-pcl-conversions ros-humble-tf2-ros
+```
+
+## 2. 编译并安装 Livox-SDK2
+
+```bash
+cd ~
+git clone https://github.com/Livox-SDK/Livox-SDK2.git
+cd ~/Livox-SDK2
+mkdir -p build
+cd build
+cmake ..
+make -j$(nproc)
+sudo make install
+```
+
+`Livox-SDK2` 是 Livox 的底层通信库。即使使用 Gazebo 仿真，后续编译
+`livox_ros_driver2` 时仍需要它。
+
+## 3. 编译 livox_ros_driver2
+
+必须将驱动放在 ROS 2 工作空间的 `src` 目录中：
+
+```bash
+mkdir -p ~/livox_ws/src
+cd ~/livox_ws/src
+git clone https://github.com/Livox-SDK/livox_ros_driver2.git
+cd ~/livox_ws/src/livox_ros_driver2
+source /opt/ros/humble/setup.bash
+./build.sh humble
+```
+
+编译完成后加载驱动环境：
+
+```bash
+source ~/livox_ws/install/setup.bash
+```
+
+对于本项目，`livox_ros_driver2` 不仅可连接真实 MID-360，也提供
+`livox_ros_driver2/msg/CustomMsg` 消息接口；Gazebo MID-360 插件发布的点云正是该类型。
+
+## 4. 编译并安装 Sophus
+
+按照原项目使用的版本安装：
+
+```bash
+cd ~
+git clone https://github.com/strasdat/Sophus.git
+cd ~/Sophus
+git checkout 1.22.10
+mkdir -p build
+cd build
+cmake .. -DSOPHUS_USE_BASIC_LOGGING=ON
+make -j$(nproc)
+sudo make install
+```
+
+## 5. 安装 GTSAM
+
+PGO 和 HBA 需要 GTSAM。Ubuntu 22.04 可使用 GTSAM 官方提供的 PPA：
+
+```bash
+sudo apt install -y software-properties-common
+sudo add-apt-repository ppa:borglab/gtsam-release-4.2
+sudo apt update
+sudo apt install -y libgtsam-dev libgtsam-unstable-dev
+```
+
+## 6. 创建工作空间并下载本项目
 
 ```bash
 mkdir -p ~/fastlio2_pgo_ws/src
@@ -60,12 +136,11 @@ cd ~/fastlio2_pgo_ws/src
 git clone https://github.com/ashduwihch/FASTLIO2_ROS2_PGO.git
 ```
 
-## 编译
+## 7. 编译本项目
 
 ```bash
 cd ~/fastlio2_pgo_ws
 source /opt/ros/humble/setup.bash
-# 如果 livox_ros_driver2 没有写入 ~/.bashrc，请按实际安装位置加载：
 source ~/livox_ws/install/setup.bash
 colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
 ```
@@ -77,6 +152,14 @@ source ~/fastlio2_pgo_ws/install/setup.bash
 ```
 
 也可以将该指令加入 `~/.bashrc`。
+
+以后新开终端运行本项目时，需要先加载 ROS 2、Livox 驱动和本项目三个环境：
+
+```bash
+source /opt/ros/humble/setup.bash
+source ~/livox_ws/install/setup.bash
+source ~/fastlio2_pgo_ws/install/setup.bash
+```
 
 ## 输入话题
 
