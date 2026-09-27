@@ -25,7 +25,19 @@ Sophus 链接兼容和 RViz 显示优化，可直接配合
    ```
 
 2. 确认 `/livox/lidar` 与 `/livox/imu` 正常发布；
-3. 启动 `fastlio2 lio_launch.py`，或直接启动带回环的 `pgo pgo_launch.py`。
+3. 启动 FAST-LIO2。仅运行里程计和建图：
+
+   ```bash
+   ros2 launch fastlio2 lio_launch.py
+   ```
+
+   或直接启动 FAST-LIO2、PGO 回环和 RViz：
+
+   ```bash
+   ros2 launch pgo pgo_launch.py
+   ```
+
+   两种方式选择一种即可，不要同时启动。
 
 检查传感器话题：
 
