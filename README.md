@@ -17,6 +17,8 @@ Sophus 链接兼容和 RViz 显示优化，可直接配合
 
 推荐启动顺序：
 
+以下启动步骤需要持续运行，请分别在不同终端中执行。
+
 1. 使用 `mid360_posix_sitl.launch.py` 启动 Gazebo、PX4 和 MID-360：
 
    ```bash
@@ -28,12 +30,18 @@ Sophus 链接兼容和 RViz 显示优化，可直接配合
 3. 启动 FAST-LIO2。仅运行里程计和建图：
 
    ```bash
+   source /opt/ros/humble/setup.bash
+   source ~/livox_ws/install/setup.bash
+   source ~/fastlio2_pgo_ws/install/setup.bash
    ros2 launch fastlio2 lio_launch.py
    ```
 
    或直接启动 FAST-LIO2、PGO 回环和 RViz：
 
    ```bash
+   source /opt/ros/humble/setup.bash
+   source ~/livox_ws/install/setup.bash
+   source ~/fastlio2_pgo_ws/install/setup.bash
    ros2 launch pgo pgo_launch.py
    ```
 
@@ -95,7 +103,11 @@ Sophus 链接问题。该修改不改变算法。
 sudo apt update
 sudo apt install -y build-essential cmake git python3-colcon-common-extensions \
   libpcl-dev libeigen3-dev libyaml-cpp-dev libboost-all-dev libtbb-dev \
-  ros-humble-pcl-conversions ros-humble-tf2-ros
+  ros-humble-rclcpp ros-humble-rviz2 ros-humble-std-msgs \
+  ros-humble-sensor-msgs ros-humble-nav-msgs ros-humble-geometry-msgs \
+  ros-humble-visualization-msgs ros-humble-message-filters \
+  ros-humble-pcl-conversions ros-humble-tf2 ros-humble-tf2-ros \
+  ros-humble-rosidl-default-generators
 ```
 
 ## 2. 编译并安装 Livox-SDK2
@@ -186,8 +198,6 @@ colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
 source ~/fastlio2_pgo_ws/install/setup.bash
 ```
 
-也可以将该指令加入 `~/.bashrc`。
-
 以后新开终端运行本项目时，需要先加载 ROS 2、Livox 驱动和本项目三个环境：
 
 ```bash
@@ -230,6 +240,8 @@ fastlio2/config/lio.yaml
 仅运行激光惯性里程计和 RViz：
 
 ```bash
+source /opt/ros/humble/setup.bash
+source ~/livox_ws/install/setup.bash
 source ~/fastlio2_pgo_ws/install/setup.bash
 ros2 launch fastlio2 lio_launch.py
 ```
@@ -237,6 +249,8 @@ ros2 launch fastlio2 lio_launch.py
 ## 启动 FAST-LIO2 + PGO 回环
 
 ```bash
+source /opt/ros/humble/setup.bash
+source ~/livox_ws/install/setup.bash
 source ~/fastlio2_pgo_ws/install/setup.bash
 ros2 launch pgo pgo_launch.py
 ```
