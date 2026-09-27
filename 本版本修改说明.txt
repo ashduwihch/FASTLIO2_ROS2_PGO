@@ -27,10 +27,11 @@ Gazebo 启动、暂停、场景切换或当前扫描没有有效命中时，可�
 
 三、补充 Sophus 链接
 
-在 fastlio2 的 CMake 配置中显式链接 Sophus::Sophus，解决部分环境下头文件可以
-找到、但最终链接不完整的问题。该修改不影响 FAST-LIO2 算法。
+在 fastlio2 和 HBA 的 CMake 配置中显式链接 Sophus::Sophus，解决部分环境下
+已经找到 Sophus、但编译时仍提示 sophus/so3.hpp 不存在或链接不完整的问题。
+该修改不影响 FAST-LIO2 或 HBA 算法。
 
-修改文件：fastlio2/CMakeLists.txt
+修改文件：fastlio2/CMakeLists.txt、hba/CMakeLists.txt
 
 四、调整 PGO 的 RViz 默认显示
 
@@ -42,4 +43,3 @@ RViz 中按需重新启用世界点云和路径。
 
 以上修改不改变 FAST-LIO2 的点云匹配、IESKF、PGO 回环检测、GTSAM 位姿图优化、
 重定位或 HBA 算法逻辑。
-

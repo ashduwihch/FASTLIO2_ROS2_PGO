@@ -71,8 +71,8 @@ Gazebo 启动、暂停、场景切换或雷达没有有效命中时，可能产�
 
 ### 3. 补充 Sophus 链接目标
 
-在 `fastlio2/CMakeLists.txt` 中显式链接 `Sophus::Sophus`，解决当前环境下可能出现的
-Sophus 链接问题。该修改不改变算法。
+在 FAST-LIO2 与 HBA 的构建配置中显式链接 `Sophus::Sophus`，解决已经找到
+Sophus、但编译时仍提示 `sophus/so3.hpp` 不存在的问题。该修改不改变算法。
 
 ### 4. 优化 PGO 的 RViz 默认显示
 
@@ -174,6 +174,15 @@ sudo add-apt-repository ppa:borglab/gtsam-release-4.2
 sudo apt update
 sudo apt install -y libgtsam-dev libgtsam-unstable-dev
 ```
+
+如果选择从源码编译 GTSAM 4.2，请在 CMake 配置时加入：
+
+```bash
+-DGTSAM_USE_SYSTEM_EIGEN=ON
+```
+
+否则 GTSAM 可能使用自带的 Eigen 3.3.7，而 ROS 2 / PCL 使用系统 Eigen 3.4，
+编译 HBA 时会因 Eigen 版本不一致而失败。
 
 ## 6. 创建工作空间并下载本项目
 

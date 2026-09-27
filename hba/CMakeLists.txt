@@ -46,7 +46,7 @@ set(SRC_LIST src/hba/commons.cpp
 
 add_executable(hba_node src/hba_node.cpp ${SRC_LIST})
 ament_target_dependencies(hba_node rclcpp std_msgs sensor_msgs interface pcl_conversions GTSAM)
-target_link_libraries(hba_node ${PCL_LIBRARIES} gtsam yaml-cpp)
+target_link_libraries(hba_node ${PCL_LIBRARIES} gtsam yaml-cpp Sophus::Sophus)
 
 install(TARGETS hba_node DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY launch DESTINATION share/${PROJECT_NAME})
