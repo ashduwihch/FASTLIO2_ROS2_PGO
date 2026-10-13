@@ -27,6 +27,7 @@ find_package(pcl_conversions REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(PCL REQUIRED)
 find_package(yaml-cpp REQUIRED)
+find_package(Open3D REQUIRED)
 
 
 
@@ -36,15 +37,13 @@ include_directories(
 )
 
 
-set(SRC_LIST src/localizers/commons.cpp
-             src/localizers/icp_localizer.cpp)
-
-add_executable(localizer_node src/localizer_node.cpp ${SRC_LIST})
+add_executable(localizer_node src/localizer_node.cpp)
 ament_target_dependencies(localizer_node rclcpp std_msgs sensor_msgs nav_msgs message_filters pcl_conversions tf2_ros geometry_msgs interface)
-target_link_libraries(localizer_node ${PCL_LIBRARIES}  yaml-cpp) 
+target_link_libraries(localizer_node ${PCL_LIBRARIES} yaml-cpp Open3D::Open3D)
 
 
 install(TARGETS localizer_node DESTINATION lib/${PROJECT_NAME})
+install(PROGRAMS scripts/publish_initial_pose.py DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY launch DESTINATION share/${PROJECT_NAME})
 install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
 install(DIRECTORY rviz DESTINATION share/${PROJECT_NAME})

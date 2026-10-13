@@ -1,0 +1,8 @@
+pgo/maps/*
+!pgo/maps/.gitkeep
+
+__pycache__/
+*.py[cod]
+build/
+install/
+log/

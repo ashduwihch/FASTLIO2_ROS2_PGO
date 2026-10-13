@@ -1,50 +1,115 @@
-#include <queue>
-#include <mutex>
+// ROS 2 port of HViktorTsoi/FAST_LIO_LOCALIZATION's global localization and
+// transform-fusion pipeline. Licensed under GPL-2.0-only.
+#include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <filesystem>
+#include <iomanip>
+#include <memory>
+#include <mutex>
+#include <sstream>
+#include <string>
+
+#include <Eigen/Core>
+#include <Eigen/Geometry>
+#include <open3d/Open3D.h>
+#include <pcl/io/pcd_io.h>
+#include <pcl/point_types.h>
+#include <pcl_conversions/pcl_conversions.h>
+#include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
+#include <geometry_msgs/msg/transform_stamped.hpp>
+#include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
-#include <nav_msgs/msg/odometry.hpp>
-#include <message_filters/subscriber.h>
-#include <message_filters/sync_policies/approximate_time.h>
-#include <message_filters/synchronizer.h>
-
-#include <pcl_conversions/pcl_conversions.h>
 #include <tf2_ros/transform_broadcaster.h>
-#include <geometry_msgs/msg/pose_stamped.hpp>
-
-#include "localizers/commons.h"
-#include "localizers/icp_localizer.h"
-#include "interface/srv/relocalize.hpp"
-#include "interface/srv/is_valid.hpp"
 #include <yaml-cpp/yaml.h>
 
-using namespace std::chrono_literals;
+#include "interface/srv/is_valid.hpp"
+#include "interface/srv/relocalize.hpp"
 
-struct NodeConfig
+using PointT = pcl::PointXYZI;
+using PclCloud = pcl::PointCloud<PointT>;
+using O3dCloud = open3d::geometry::PointCloud;
+
+namespace
 {
-    std::string cloud_topic = "/fastlio2/body_cloud";
+Eigen::Matrix4d poseToMatrix(const geometry_msgs::msg::Pose &pose)
+{
+    Eigen::Quaterniond q(pose.orientation.w, pose.orientation.x,
+                         pose.orientation.y, pose.orientation.z);
+    q = q.norm() < 1e-9 ? Eigen::Quaterniond::Identity() : q.normalized();
+    Eigen::Matrix4d t = Eigen::Matrix4d::Identity();
+    t.block<3, 3>(0, 0) = q.toRotationMatrix();
+    t.block<3, 1>(0, 3) = Eigen::Vector3d(
+        pose.position.x, pose.position.y, pose.position.z);
+    return t;
+}
+
+geometry_msgs::msg::Pose matrixToPose(const Eigen::Matrix4d &t)
+{
+    geometry_msgs::msg::Pose pose;
+    Eigen::Quaterniond q(t.block<3, 3>(0, 0));
+    q.normalize();
+    pose.position.x = t(0, 3);
+    pose.position.y = t(1, 3);
+    pose.position.z = t(2, 3);
+    pose.orientation.x = q.x();
+    pose.orientation.y = q.y();
+    pose.orientation.z = q.z();
+    pose.orientation.w = q.w();
+    return pose;
+}
+
+std::shared_ptr<O3dCloud> pclToOpen3d(const PclCloud &cloud)
+{
+    auto result = std::make_shared<O3dCloud>();
+    result->points_.reserve(cloud.size());
+    for (const auto &p : cloud.points)
+        if (std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z))
+            result->points_.emplace_back(p.x, p.y, p.z);
+    return result;
+}
+
+PclCloud::Ptr open3dToPcl(const O3dCloud &cloud, std::size_t stride)
+{
+    auto result = std::make_shared<PclCloud>();
+    stride = std::max<std::size_t>(stride, 1);
+    result->reserve((cloud.points_.size() + stride - 1) / stride);
+    for (std::size_t i = 0; i < cloud.points_.size(); i += stride)
+    {
+        PointT p;
+        p.x = cloud.points_[i].x();
+        p.y = cloud.points_[i].y();
+        p.z = cloud.points_[i].z();
+        p.intensity = 0.0F;
+        result->push_back(p);
+    }
+    result->width = result->size();
+    result->height = 1;
+    result->is_dense = true;
+    return result;
+}
+}  // namespace
+
+struct Config
+{
+    std::string cloud_topic = "/fastlio2/world_cloud";
     std::string odom_topic = "/fastlio2/lio_odom";
     std::string map_frame = "map";
-    std::string local_frame = "lidar";
-    double update_hz = 1.0;
-};
-
-struct NodeState
-{
-    std::mutex message_mutex;
-    std::mutex service_mutex;
-
-    bool message_received = false;
-    bool service_received = false;
-    bool localize_success = false;
-    rclcpp::Time last_send_tf_time = rclcpp::Clock().now();
-    builtin_interfaces::msg::Time last_message_time;
-    CloudType::Ptr last_cloud = std::make_shared<CloudType>();
-    M3D last_r;                          // localmap_body_r
-    V3D last_t;                          // localmap_body_t
-    M3D last_offset_r = M3D::Identity(); // map_localmap_r
-    V3D last_offset_t = V3D::Zero();     // map_localmap_t
-    M4F initial_guess = M4F::Identity();
+    std::string odom_frame = "lidar";
+    std::string body_frame = "body";
+    std::string map_path;
+    double map_voxel_size = 0.4;
+    double scan_voxel_size = 0.1;
+    double localization_frequency = 0.5;
+    double publish_frequency = 50.0;
+    double localization_threshold = 0.95;
+    double fov = 2.0 * M_PI;
+    double fov_far = 30.0;
+    int max_iteration = 20;
+    int submap_publish_stride = 10;
+    bool override_initial_z = true;
+    double initial_z = 0.5;
 };
 
 class LocalizerNode : public rclcpp::Node
@@ -52,240 +117,361 @@ class LocalizerNode : public rclcpp::Node
 public:
     LocalizerNode() : Node("localizer_node")
     {
-        RCLCPP_INFO(this->get_logger(), "Localizer Node Started");
+        RCLCPP_INFO(get_logger(), "FAST_LIO_LOCALIZATION ROS 2 port started");
         loadParameters();
-        rclcpp::QoS qos = rclcpp::QoS(10);
-        m_cloud_sub.subscribe(this, m_config.cloud_topic, qos.get_rmw_qos_profile());
-        m_odom_sub.subscribe(this, m_config.odom_topic, qos.get_rmw_qos_profile());
+        sensor_group_ = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+        localization_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        fusion_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        rclcpp::SubscriptionOptions sensor_options;
+        sensor_options.callback_group = sensor_group_;
+        rclcpp::SubscriptionOptions localization_options;
+        localization_options.callback_group = localization_group_;
+        const auto sensor_qos = rclcpp::SensorDataQoS().keep_last(5);
+        cloud_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
+            config_.cloud_topic, sensor_qos,
+            std::bind(&LocalizerNode::cloudCallback, this, std::placeholders::_1),
+            sensor_options);
+        odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
+            config_.odom_topic, sensor_qos,
+            std::bind(&LocalizerNode::odomCallback, this, std::placeholders::_1),
+            sensor_options);
+        initial_pose_sub_ = create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
+            "/initialpose", 10,
+            std::bind(&LocalizerNode::initialPoseCallback, this, std::placeholders::_1),
+            localization_options);
 
-        m_tf_broadcaster = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
+        map_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
+            "/map", rclcpp::QoS(1).reliable().transient_local());
+        scan_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>("/cur_scan_in_map", 1);
+        submap_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>("/submap", 1);
+        map_to_odom_pub_ = create_publisher<nav_msgs::msg::Odometry>("/map_to_odom", 1);
+        localization_pub_ = create_publisher<nav_msgs::msg::Odometry>("/localization", 1);
+        tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
-        m_sync = std::make_shared<message_filters::Synchronizer<message_filters::sync_policies::ApproximateTime<sensor_msgs::msg::PointCloud2, nav_msgs::msg::Odometry>>>(message_filters::sync_policies::ApproximateTime<sensor_msgs::msg::PointCloud2, nav_msgs::msg::Odometry>(10), m_cloud_sub, m_odom_sub);
-        m_sync->setAgePenalty(0.1);
-        m_sync->registerCallback(std::bind(&LocalizerNode::syncCB, this, std::placeholders::_1, std::placeholders::_2));
-        m_localizer = std::make_shared<ICPLocalizer>(m_localizer_config);
+        relocalize_service_ = create_service<interface::srv::Relocalize>(
+            "relocalize", std::bind(&LocalizerNode::relocalizeCallback, this,
+                                     std::placeholders::_1, std::placeholders::_2),
+            rmw_qos_profile_services_default, localization_group_);
+        check_service_ = create_service<interface::srv::IsValid>(
+            "relocalize_check", std::bind(&LocalizerNode::checkCallback, this,
+                                           std::placeholders::_1, std::placeholders::_2),
+            rmw_qos_profile_services_default, sensor_group_);
 
-        m_reloc_srv = this->create_service<interface::srv::Relocalize>("relocalize", std::bind(&LocalizerNode::relocCB, this, std::placeholders::_1, std::placeholders::_2));
+        if (!loadMap(config_.map_path))
+            RCLCPP_ERROR(get_logger(), "Prior map unavailable; localization is disabled");
 
-        m_reloc_check_srv = this->create_service<interface::srv::IsValid>("relocalize_check", std::bind(&LocalizerNode::relocCheckCB, this, std::placeholders::_1, std::placeholders::_2));
-
-        m_map_cloud_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("map_cloud", 10);
-
-        m_timer = this->create_wall_timer(10ms, std::bind(&LocalizerNode::timerCB, this));
-    }
-
-    void loadParameters()
-    {
-        this->declare_parameter("config_path", "");
-        std::string config_path;
-        this->get_parameter<std::string>("config_path", config_path);
-        YAML::Node config = YAML::LoadFile(config_path);
-        if (!config)
-        {
-            RCLCPP_WARN(this->get_logger(), "FAIL TO LOAD YAML FILE!");
-            return;
-        }
-        RCLCPP_INFO(this->get_logger(), "LOAD FROM YAML CONFIG PATH: %s", config_path.c_str());
-
-        m_config.cloud_topic = config["cloud_topic"].as<std::string>();
-        m_config.odom_topic = config["odom_topic"].as<std::string>();
-        m_config.map_frame = config["map_frame"].as<std::string>();
-        m_config.local_frame = config["local_frame"].as<std::string>();
-        m_config.update_hz = config["update_hz"].as<double>();
-
-        m_localizer_config.rough_scan_resolution = config["rough_scan_resolution"].as<double>();
-        m_localizer_config.rough_map_resolution = config["rough_map_resolution"].as<double>();
-        m_localizer_config.rough_max_iteration = config["rough_max_iteration"].as<int>();
-        m_localizer_config.rough_score_thresh = config["rough_score_thresh"].as<double>();
-
-        m_localizer_config.refine_scan_resolution = config["refine_scan_resolution"].as<double>();
-        m_localizer_config.refine_map_resolution = config["refine_map_resolution"].as<double>();
-        m_localizer_config.refine_max_iteration = config["refine_max_iteration"].as<int>();
-        m_localizer_config.refine_score_thresh = config["refine_score_thresh"].as<double>();
-    }
-    void timerCB()
-    {
-        if (!m_state.message_received)
-            return;
-
-        rclcpp::Duration diff = rclcpp::Clock().now() - m_state.last_send_tf_time;
-
-        bool update_tf = diff.seconds() > (1.0 / m_config.update_hz) && m_state.message_received;
-
-        if (!update_tf)
-        {
-            sendBroadCastTF(m_state.last_message_time);
-            return;
-        }
-
-        m_state.last_send_tf_time = rclcpp::Clock().now();
-
-        M4F initial_guess = M4F::Identity();
-        if (m_state.service_received)
-        {
-            std::lock_guard<std::mutex>(m_state.service_mutex);
-            initial_guess = m_state.initial_guess;
-            // m_state.service_received = false;
-        }
-        else
-        {
-            std::lock_guard<std::mutex>(m_state.message_mutex);
-            initial_guess.block<3, 3>(0, 0) = (m_state.last_offset_r * m_state.last_r).cast<float>();
-            initial_guess.block<3, 1>(0, 3) = (m_state.last_offset_r * m_state.last_t + m_state.last_offset_t).cast<float>();
-        }
-
-        M3D current_local_r;
-        V3D current_local_t;
-        builtin_interfaces::msg::Time current_time;
-        {
-            std::lock_guard<std::mutex>(m_state.message_mutex);
-            current_local_r = m_state.last_r;
-            current_local_t = m_state.last_t;
-            current_time = m_state.last_message_time;
-            m_localizer->setInput(m_state.last_cloud);
-        }
-
-        bool result = m_localizer->align(initial_guess);
-        if (result)
-        {
-            M3D map_body_r = initial_guess.block<3, 3>(0, 0).cast<double>();
-            V3D map_body_t = initial_guess.block<3, 1>(0, 3).cast<double>();
-            m_state.last_offset_r = map_body_r * current_local_r.transpose();
-            m_state.last_offset_t = -map_body_r * current_local_r.transpose() * current_local_t + map_body_t;
-            if (!m_state.localize_success && m_state.service_received)
-            {
-                std::lock_guard<std::mutex>(m_state.service_mutex);
-                m_state.localize_success = true;
-                m_state.service_received = false;
-            }
-        }
-        sendBroadCastTF(current_time);
-        publishMapCloud(current_time);
-    }
-    void syncCB(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &cloud_msg, const nav_msgs::msg::Odometry::ConstSharedPtr &odom_msg)
-    {
-
-        std::lock_guard<std::mutex>(m_state.message_mutex);
-
-        pcl::fromROSMsg(*cloud_msg, *m_state.last_cloud);
-
-        m_state.last_r = Eigen::Quaterniond(odom_msg->pose.pose.orientation.w,
-                                            odom_msg->pose.pose.orientation.x,
-                                            odom_msg->pose.pose.orientation.y,
-                                            odom_msg->pose.pose.orientation.z)
-                             .toRotationMatrix();
-        m_state.last_t = V3D(odom_msg->pose.pose.position.x,
-                             odom_msg->pose.pose.position.y,
-                             odom_msg->pose.pose.position.z);
-        m_state.last_message_time = cloud_msg->header.stamp;
-        if (!m_state.message_received)
-        {
-            m_state.message_received = true;
-            m_config.local_frame = odom_msg->header.frame_id;
-        }
-    }
-
-    void sendBroadCastTF(builtin_interfaces::msg::Time &time)
-    {
-        geometry_msgs::msg::TransformStamped transformStamped;
-        transformStamped.header.frame_id = m_config.map_frame;
-        transformStamped.child_frame_id = m_config.local_frame;
-        transformStamped.header.stamp = time;
-        Eigen::Quaterniond q(m_state.last_offset_r);
-        V3D t = m_state.last_offset_t;
-        transformStamped.transform.translation.x = t.x();
-        transformStamped.transform.translation.y = t.y();
-        transformStamped.transform.translation.z = t.z();
-        transformStamped.transform.rotation.x = q.x();
-        transformStamped.transform.rotation.y = q.y();
-        transformStamped.transform.rotation.z = q.z();
-        transformStamped.transform.rotation.w = q.w();
-        m_tf_broadcaster->sendTransform(transformStamped);
-    }
-
-    void relocCB(const std::shared_ptr<interface::srv::Relocalize::Request> request, std::shared_ptr<interface::srv::Relocalize::Response> response)
-    {
-        std::string pcd_path = request->pcd_path;
-        float x = request->x;
-        float y = request->y;
-        float z = request->z;
-        float yaw = request->yaw;
-        float roll = request->roll;
-        float pitch = request->pitch;
-
-        if (!std::filesystem::exists(pcd_path))
-        {
-            response->success = false;
-            response->message = "pcd file not found";
-            return;
-        }
-
-        Eigen::AngleAxisd yaw_angle = Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitZ());
-        Eigen::AngleAxisd roll_angle = Eigen::AngleAxisd(roll, Eigen::Vector3d::UnitX());
-        Eigen::AngleAxisd pitch_angle = Eigen::AngleAxisd(pitch, Eigen::Vector3d::UnitY());
-        bool load_flag = m_localizer->loadMap(pcd_path);
-        if (!load_flag)
-        {
-            response->success = false;
-            response->message = "load map failed";
-            return;
-        }
-        {
-            std::lock_guard<std::mutex>(m_state.message_mutex);
-            m_state.initial_guess.setIdentity();
-            m_state.initial_guess.block<3, 3>(0, 0) = (yaw_angle * roll_angle * pitch_angle).toRotationMatrix().cast<float>();
-            m_state.initial_guess.block<3, 1>(0, 3) = V3F(x, y, z);
-            m_state.service_received = true;
-            m_state.localize_success = false;
-        }
-
-        response->success = true;
-        response->message = "relocalize success";
-        return;
-    }
-
-    void relocCheckCB(const std::shared_ptr<interface::srv::IsValid::Request> request, std::shared_ptr<interface::srv::IsValid::Response> response)
-    {
-        std::lock_guard<std::mutex>(m_state.service_mutex);
-        if (request->code == 1)
-            response->valid = true;
-        else
-            response->valid = m_state.localize_success;
-        return;
-    }
-    void publishMapCloud(builtin_interfaces::msg::Time &time)
-    {
-        if (m_map_cloud_pub->get_subscription_count() < 1)
-            return;
-        CloudType::Ptr map_cloud = m_localizer->refineMap();
-        if (map_cloud->size() < 1)
-            return;
-        sensor_msgs::msg::PointCloud2 map_cloud_msg;
-        pcl::toROSMsg(*map_cloud, map_cloud_msg);
-        map_cloud_msg.header.frame_id = m_config.map_frame;
-        map_cloud_msg.header.stamp = time;
-        m_map_cloud_pub->publish(map_cloud_msg);
+        localization_timer_ = create_wall_timer(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::duration<double>(1.0 / std::max(config_.localization_frequency, 1e-3))),
+            std::bind(&LocalizerNode::periodicLocalization, this), localization_group_);
+        fusion_timer_ = create_wall_timer(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::duration<double>(1.0 / std::max(config_.publish_frequency, 1e-3))),
+            std::bind(&LocalizerNode::publishFusion, this), fusion_group_);
+        RCLCPP_WARN(get_logger(), "Waiting for RViz 2D Pose Estimate (/initialpose)...");
     }
 
 private:
-    NodeConfig m_config;
-    NodeState m_state;
+    void loadParameters()
+    {
+        declare_parameter("config_path", "");
+        const std::string path = get_parameter("config_path").as_string();
+        const YAML::Node y = YAML::LoadFile(path);
+        RCLCPP_INFO(get_logger(), "LOAD FROM YAML CONFIG PATH: %s", path.c_str());
+        auto s = [&y](const char *k, const std::string &v) { return y[k] ? y[k].as<std::string>() : v; };
+        auto d = [&y](const char *k, double v) { return y[k] ? y[k].as<double>() : v; };
+        auto i = [&y](const char *k, int v) { return y[k] ? y[k].as<int>() : v; };
+        auto b = [&y](const char *k, bool v) { return y[k] ? y[k].as<bool>() : v; };
+        config_.cloud_topic = s("cloud_topic", config_.cloud_topic);
+        config_.odom_topic = s("odom_topic", config_.odom_topic);
+        config_.map_frame = s("map_frame", config_.map_frame);
+        config_.odom_frame = s("odom_frame", config_.odom_frame);
+        config_.body_frame = s("body_frame", config_.body_frame);
+        config_.map_path = s("map_path", config_.map_path);
+        config_.map_voxel_size = d("map_voxel_size", config_.map_voxel_size);
+        config_.scan_voxel_size = d("scan_voxel_size", config_.scan_voxel_size);
+        config_.localization_frequency = d("localization_frequency", config_.localization_frequency);
+        config_.publish_frequency = d("publish_frequency", config_.publish_frequency);
+        config_.localization_threshold = d("localization_threshold", config_.localization_threshold);
+        config_.fov = d("fov", config_.fov);
+        config_.fov_far = d("fov_far", config_.fov_far);
+        config_.max_iteration = i("max_iteration", config_.max_iteration);
+        config_.submap_publish_stride = i("submap_publish_stride", config_.submap_publish_stride);
+        config_.override_initial_z = b("override_initial_z", config_.override_initial_z);
+        config_.initial_z = d("initial_z", config_.initial_z);
+    }
 
-    ICPConfig m_localizer_config;
-    std::shared_ptr<ICPLocalizer> m_localizer;
-    message_filters::Subscriber<sensor_msgs::msg::PointCloud2> m_cloud_sub;
-    message_filters::Subscriber<nav_msgs::msg::Odometry> m_odom_sub;
-    rclcpp::TimerBase::SharedPtr m_timer;
-    std::shared_ptr<message_filters::Synchronizer<message_filters::sync_policies::ApproximateTime<sensor_msgs::msg::PointCloud2, nav_msgs::msg::Odometry>>> m_sync;
-    std::shared_ptr<tf2_ros::TransformBroadcaster> m_tf_broadcaster;
-    rclcpp::Service<interface::srv::Relocalize>::SharedPtr m_reloc_srv;
-    rclcpp::Service<interface::srv::IsValid>::SharedPtr m_reloc_check_srv;
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr m_map_cloud_pub;
+    bool loadMap(const std::string &path)
+    {
+        if (path.empty() || !std::filesystem::exists(path))
+        {
+            RCLCPP_ERROR(get_logger(), "PCD map not found: %s", path.c_str());
+            return false;
+        }
+        PclCloud pcl_map;
+        if (pcl::io::loadPCDFile<PointT>(path, pcl_map) < 0)
+            return false;
+        auto map = pclToOpen3d(pcl_map)->VoxelDownSample(config_.map_voxel_size);
+        if (map->IsEmpty())
+            return false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            global_map_ = map;
+            config_.map_path = path;
+            map_loaded_ = true;
+        }
+        publishCloud(map_pub_, *map, config_.map_frame, now(), 1);
+        RCLCPP_INFO(get_logger(), "Global map received: %zu points (%s)", map->points_.size(), path.c_str());
+        return true;
+    }
+
+    void cloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
+    {
+        PclCloud pcl_cloud;
+        pcl::fromROSMsg(*msg, pcl_cloud);
+        auto scan = pclToOpen3d(pcl_cloud);
+        if (scan->IsEmpty())
+            return;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            current_scan_ = scan;
+        }
+        auto display = *msg;
+        display.header.frame_id = config_.odom_frame;
+        scan_pub_->publish(display);
+    }
+
+    void odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        current_odom_ = msg;
+    }
+
+    void initialPoseCallback(const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg)
+    {
+        if (!msg->header.frame_id.empty() && msg->header.frame_id != config_.map_frame)
+        {
+            RCLCPP_WARN(get_logger(), "Initial pose frame [%s] is not [%s]",
+                        msg->header.frame_id.c_str(), config_.map_frame.c_str());
+            return;
+        }
+        Eigen::Matrix4d initial = poseToMatrix(msg->pose.pose);
+        // RViz 2D Pose Estimate sends z=0; keep a configurable UAV height for
+        // that case, but preserve an explicitly supplied 6-DoF z value.
+        if (config_.override_initial_z && std::abs(initial(2, 3)) < 1e-6)
+            initial(2, 3) = config_.initial_z;
+        RCLCPP_INFO(get_logger(), "Initial pose: x=%.3f y=%.3f z=%.3f",
+                    initial(0, 3), initial(1, 3), initial(2, 3));
+        runLocalization(initial, true);
+    }
+
+    void relocalizeCallback(const std::shared_ptr<interface::srv::Relocalize::Request> req,
+                            std::shared_ptr<interface::srv::Relocalize::Response> res)
+    {
+        if (!req->pcd_path.empty() && req->pcd_path != config_.map_path && !loadMap(req->pcd_path))
+        {
+            res->success = false; res->message = "load map failed"; return;
+        }
+        const Eigen::AngleAxisd yaw(req->yaw, Eigen::Vector3d::UnitZ());
+        const Eigen::AngleAxisd pitch(req->pitch, Eigen::Vector3d::UnitY());
+        const Eigen::AngleAxisd roll(req->roll, Eigen::Vector3d::UnitX());
+        Eigen::Matrix4d initial = Eigen::Matrix4d::Identity();
+        initial.block<3, 3>(0, 0) = (yaw * pitch * roll).toRotationMatrix();
+        initial.block<3, 1>(0, 3) = Eigen::Vector3d(req->x, req->y, req->z);
+        res->success = runLocalization(initial, true);
+        res->message = res->success ? "relocalization succeeded" : "relocalization failed";
+    }
+
+    void checkCallback(const std::shared_ptr<interface::srv::IsValid::Request> req,
+                       std::shared_ptr<interface::srv::IsValid::Response> res)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        res->valid = req->code == 1 || initialized_;
+    }
+
+    void periodicLocalization()
+    {
+        Eigen::Matrix4d estimate;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!initialized_ || matching_) return;
+            estimate = map_to_odom_;
+        }
+        runLocalization(estimate, false);
+    }
+
+    bool runLocalization(const Eigen::Matrix4d &estimate, bool initialization)
+    {
+        std::shared_ptr<O3dCloud> scan, map;
+        nav_msgs::msg::Odometry::SharedPtr odom;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (matching_) { RCLCPP_WARN(get_logger(), "Localization already running"); return false; }
+            if (!map_loaded_ || !global_map_) { RCLCPP_WARN(get_logger(), "Waiting for global map"); return false; }
+            if (!current_scan_ || !current_odom_) { RCLCPP_WARN(get_logger(), "First scan or odometry not received"); return false; }
+            matching_ = true;
+            scan = std::make_shared<O3dCloud>(*current_scan_);
+            map = global_map_;
+            odom = std::make_shared<nav_msgs::msg::Odometry>(*current_odom_);
+        }
+
+        RCLCPP_INFO(get_logger(), "Global localization by scan-to-map matching...");
+        const auto start = std::chrono::steady_clock::now();
+        auto submap = cropMap(*map, estimate, *odom);
+        publishCloud(submap_pub_, *submap, config_.map_frame, rclcpp::Time(odom->header.stamp),
+                     config_.submap_publish_stride);
+        const bool valid = !scan->IsEmpty() && !submap->IsEmpty();
+        open3d::pipelines::registration::RegistrationResult coarse, fine;
+        if (valid)
+        {
+            coarse = registrationAtScale(*scan, *submap, estimate, 5.0);
+            fine = registrationAtScale(*scan, *submap, coarse.transformation_, 1.0);
+        }
+        const double seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - start).count();
+        const double fitness = valid ? fine.fitness_ : 0.0;
+        const double rmse = valid ? fine.inlier_rmse_ : 0.0;
+        Eigen::Matrix4d transform = estimate;
+        if (valid)
+            transform = fine.transformation_;
+        std::ostringstream matrix;
+        matrix << std::fixed << std::setprecision(4) << transform;
+        RCLCPP_INFO(get_logger(), "Time: %.3f s", seconds);
+        RCLCPP_INFO(get_logger(), "coarse fitness: %.6f", valid ? coarse.fitness_ : 0.0);
+        RCLCPP_INFO(get_logger(), "fitness score: %.6f, inlier RMSE: %.6f", fitness, rmse);
+        RCLCPP_INFO(get_logger(), "estimated map_to_odom:\n%s", matrix.str().c_str());
+
+        const bool success = valid && fitness > config_.localization_threshold;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (success) { map_to_odom_ = transform; initialized_ = true; }
+            matching_ = false;
+        }
+        if (success)
+        {
+            publishMapToOdom(transform, odom->header.stamp);
+            if (initialization) RCLCPP_INFO(get_logger(), "Initialize successfully!");
+        }
+        else
+            RCLCPP_WARN(get_logger(), "Not match! fitness %.6f <= threshold %.6f",
+                        fitness, config_.localization_threshold);
+        return success;
+    }
+
+    std::shared_ptr<O3dCloud> cropMap(const O3dCloud &map, const Eigen::Matrix4d &estimate,
+                                      const nav_msgs::msg::Odometry &odom) const
+    {
+        const Eigen::Matrix4d body_from_map = (estimate * poseToMatrix(odom.pose.pose)).inverse();
+        auto result = std::make_shared<O3dCloud>();
+        result->points_.reserve(map.points_.size());
+        for (const auto &p : map.points_)
+        {
+            const Eigen::Vector3d body = (body_from_map * Eigen::Vector4d(p.x(), p.y(), p.z(), 1.0)).head<3>();
+            const double angle = std::abs(std::atan2(body.y(), body.x()));
+            const bool inside = config_.fov > M_PI
+                ? body.x() < config_.fov_far && angle < config_.fov / 2.0
+                : body.x() > 0.0 && body.x() < config_.fov_far && angle < config_.fov / 2.0;
+            if (inside) result->points_.push_back(p);
+        }
+        return result;
+    }
+
+    open3d::pipelines::registration::RegistrationResult registrationAtScale(
+        const O3dCloud &scan, const O3dCloud &map, const Eigen::Matrix4d &initial, double scale) const
+    {
+        const auto scan_down = scan.VoxelDownSample(config_.scan_voxel_size * scale);
+        const auto map_down = map.VoxelDownSample(config_.map_voxel_size * scale);
+        const open3d::pipelines::registration::TransformationEstimationPointToPoint estimation(false);
+        const open3d::pipelines::registration::ICPConvergenceCriteria criteria(1e-6, 1e-6, config_.max_iteration);
+        return open3d::pipelines::registration::RegistrationICP(
+            *scan_down, *map_down, scale, initial, estimation, criteria);
+    }
+
+    void publishFusion()
+    {
+        Eigen::Matrix4d map_to_odom;
+        nav_msgs::msg::Odometry::SharedPtr odom;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            map_to_odom = map_to_odom_;
+            if (current_odom_) odom = std::make_shared<nav_msgs::msg::Odometry>(*current_odom_);
+        }
+        // Do not mix the host clock with Gazebo sensor time.  Publishing a TF
+        // stamped with now() before the first odometry message poisons RViz's
+        // TF cache: all subsequent simulation-time transforms look ancient.
+        if (!odom)
+            return;
+
+        geometry_msgs::msg::TransformStamped tf;
+        // FAST-LIO/Gazebo messages carry simulation sensor time.  Stamp the TF
+        // from the same clock so RViz does not reject scans as TF_OLD_DATA.
+        tf.header.stamp = odom->header.stamp;
+        tf.header.frame_id = config_.map_frame;
+        tf.child_frame_id = config_.odom_frame;
+        const auto pose = matrixToPose(map_to_odom);
+        tf.transform.translation.x = pose.position.x;
+        tf.transform.translation.y = pose.position.y;
+        tf.transform.translation.z = pose.position.z;
+        tf.transform.rotation = pose.orientation;
+        tf_broadcaster_->sendTransform(tf);
+
+        nav_msgs::msg::Odometry localization;
+        localization.header.stamp = odom->header.stamp;
+        localization.header.frame_id = config_.map_frame;
+        localization.child_frame_id = config_.body_frame;
+        localization.pose.pose = matrixToPose(map_to_odom * poseToMatrix(odom->pose.pose));
+        localization.pose.covariance = odom->pose.covariance;
+        localization.twist = odom->twist;
+        localization_pub_->publish(localization);
+    }
+
+    void publishMapToOdom(const Eigen::Matrix4d &transform,
+                          const builtin_interfaces::msg::Time &stamp)
+    {
+        nav_msgs::msg::Odometry msg;
+        msg.header.stamp = stamp;
+        msg.header.frame_id = config_.map_frame;
+        msg.child_frame_id = config_.odom_frame;
+        msg.pose.pose = matrixToPose(transform);
+        map_to_odom_pub_->publish(msg);
+    }
+
+    void publishCloud(const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr &pub,
+                      const O3dCloud &cloud, const std::string &frame,
+                      const rclcpp::Time &stamp, std::size_t stride)
+    {
+        sensor_msgs::msg::PointCloud2 msg;
+        pcl::toROSMsg(*open3dToPcl(cloud, stride), msg);
+        msg.header.frame_id = frame;
+        msg.header.stamp = stamp;
+        pub->publish(msg);
+    }
+
+    Config config_;
+    std::mutex mutex_;
+    std::shared_ptr<O3dCloud> global_map_, current_scan_;
+    nav_msgs::msg::Odometry::SharedPtr current_odom_;
+    Eigen::Matrix4d map_to_odom_ = Eigen::Matrix4d::Identity();
+    bool map_loaded_ = false, initialized_ = false, matching_ = false;
+    rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+    rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr initial_pose_sub_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_pub_, scan_pub_, submap_pub_;
+    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr map_to_odom_pub_, localization_pub_;
+    rclcpp::Service<interface::srv::Relocalize>::SharedPtr relocalize_service_;
+    rclcpp::Service<interface::srv::IsValid>::SharedPtr check_service_;
+    rclcpp::TimerBase::SharedPtr localization_timer_, fusion_timer_;
+    rclcpp::CallbackGroup::SharedPtr sensor_group_, localization_group_, fusion_group_;
+    std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
 };
+
 int main(int argc, char **argv)
 {
     rclcpp::init(argc, argv);
-    rclcpp::spin(std::make_shared<LocalizerNode>());
+    auto node = std::make_shared<LocalizerNode>();
+    rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 3);
+    executor.add_node(node);
+    executor.spin();
     rclcpp::shutdown();
     return 0;
 }

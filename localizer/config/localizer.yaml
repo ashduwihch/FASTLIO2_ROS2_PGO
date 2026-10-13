@@ -1,15 +1,26 @@
-cloud_topic: /fastlio2/body_cloud
+# FAST_LIO_LOCALIZATION 的 ROS 2 / MID360 适配参数。
+# 输入必须是 FAST-LIO 已经转换到里程计坐标系的当前扫描，而不是机体系扫描。
+cloud_topic: /fastlio2/world_cloud
 odom_topic: /fastlio2/lio_odom
+
 map_frame: map
-local_frame: lidar
-update_hz: 1.0
+odom_frame: lidar
+body_frame: body
+map_path: /home/lin/fastlio2_pgo_ws/src/FASTLIO2_ROS2_PGO/pgo/maps/map.pcd
 
-rough_scan_resolution: 0.25
-rough_map_resolution: 0.25
-rough_max_iteration: 5
-rough_score_thresh: 0.2
+# 保留原版 FAST_LIO_LOCALIZATION 的 Open3D ICP 参数。
+map_voxel_size: 0.4
+scan_voxel_size: 0.1
+localization_frequency: 0.5
+publish_frequency: 50.0
+localization_threshold: 0.95
+max_iteration: 20
 
-refine_scan_resolution: 0.1
-refine_map_resolution: 0.1
-refine_max_iteration: 10
-refine_score_thresh: 0.1
+# mapping_360.launch 对应 MID360 的 360 度水平视场；距离与当前 LIO 配置一致。
+fov: 6.283185307179586
+fov_far: 30.0
+submap_publish_stride: 10
+
+# RViz 的“2D Pose Estimate”只给 x/y/yaw；仿真无人机初始高度从这里补齐。
+override_initial_z: true
+initial_z: 0.5

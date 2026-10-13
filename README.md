@@ -13,6 +13,13 @@ Sophus 链接兼容和 RViz 显示优化，可直接配合
 [`ashduwihch/mid360_gazebo_harmonic`](https://github.com/ashduwihch/mid360_gazebo_harmonic)
 使用。
 
+## 版本记录
+
+| 版本 | 日期 | 主要变化 |
+| --- | --- | --- |
+| `v0.2.0` | 2026-10-13 | PGO 支持退出时自动保存优化地图；将重定位更新为 ROS 2 移植版 FAST_LIO_LOCALIZATION，支持 RViz `2D Pose Estimate` 初值、粗到细 Open3D ICP、匹配分数输出和持续 scan-to-map 校正。 |
+| `v0.1.0` | 2026-09-27 | 完成 Ubuntu 22.04、ROS 2 Humble 与 Gazebo Harmonic MID-360 仿真适配。 |
+
 ## 与 MID-360 Gazebo 插件配合
 
 推荐启动顺序：
@@ -79,6 +86,17 @@ Sophus、但编译时仍提示 `sophus/so3.hpp` 不存在的问题。该修改�
 默认关闭容易造成长期显示卡顿的累计 `world_cloud` 和路径显示，并增加里程计箭头。
 需要查看累计世界点云时，可在 RViz 中手动启用 `/fastlio2/world_cloud`。
 
+### 5. 增加 PGO 自动保存地图
+
+支持在正常使用 `Ctrl+C` 结束 `pgo_node` 时，将优化后的地图和位姿保存到配置目录；
+原有 `/pgo/save_maps` 手动保存服务仍然保留。
+
+### 6. 更新重定位模块
+
+将重定位更新为 `HViktorTsoi/FAST_LIO_LOCALIZATION` 的 ROS 2 移植实现，保留其
+Open3D scan-to-map ICP、匹配分数判断和坐标变换融合思路，并适配当前 FAST-LIO2、
+MID-360 话题与 RViz `2D Pose Estimate` 交互。
+
 详细差异见 [`本版本修改说明.txt`](本版本修改说明.txt)。
 
 ## 环境与依赖
@@ -103,6 +121,7 @@ Sophus、但编译时仍提示 `sophus/so3.hpp` 不存在的问题。该修改�
 sudo apt update
 sudo apt install -y build-essential cmake git python3-colcon-common-extensions \
   libpcl-dev libeigen3-dev libyaml-cpp-dev libboost-all-dev libtbb-dev \
+  libopen3d-dev \
   ros-humble-rclcpp ros-humble-rviz2 ros-humble-std-msgs \
   ros-humble-sensor-msgs ros-humble-nav-msgs ros-humble-geometry-msgs \
   ros-humble-visualization-msgs ros-humble-message-filters \
@@ -277,6 +296,22 @@ PGO 会持续检测可能的历史重访位置并进行位姿图优化，不是�
 
 ## 保存地图
 
+当前配置默认在正常使用 `Ctrl+C` 结束 `pgo_node` 时自动保存，配置位于
+`pgo/config/pgo.yaml`：
+
+```yaml
+map_save:
+  save_on_shutdown: true
+  save_path: /home/lin/fastlio2_pgo_ws/src/FASTLIO2_ROS2_PGO/pgo/maps
+  save_patches: false
+```
+
+程序会自动创建保存目录，并生成 `map.pcd` 和 `poses.txt`。当
+`save_patches: true` 时还会生成 `patches/`，供 HBA 使用。
+如需关闭退出自动保存，将 `save_on_shutdown` 改为 `false`。
+
+运行过程中仍可随时手动保存：
+
 ```bash
 ros2 service call /pgo/save_maps interface/srv/SaveMaps \
   "{file_path: '/绝对路径/地图目录', save_patches: true}"
@@ -287,6 +322,26 @@ ros2 service call /pgo/save_maps interface/srv/SaveMaps \
 ```bash
 ros2 launch localizer localizer_launch.py
 ```
+
+启动后会自动加载 `localizer/config/localizer.yaml` 中 `map_path` 指向的先验地图。
+在 RViz 中点击 **2D Pose Estimate**，然后在地图上按住鼠标拖出表示大致朝向的箭头，
+程序会接收 `/initialpose` 并自动执行粗到细两阶段 ICP。箭头提供 `x、y、yaw`，
+当箭头消息没有给出高度且 `override_initial_z: true` 时，`z` 使用配置文件中的
+`initial_z`；`roll` 和 `pitch` 保持 RViz 消息给出的值（2D 工具通常为 0）。
+
+默认配置为：
+
+```yaml
+map_path: /home/lin/fastlio2_pgo_ws/src/FASTLIO2_ROS2_PGO/pgo/maps/map.pcd
+localization_frequency: 0.5
+localization_threshold: 0.95
+override_initial_z: true
+initial_z: 0.5
+```
+
+终端的 `fitness score` 高于 `localization_threshold` 表示匹配成功，之后会按照
+`localization_frequency` 持续使用先验地图校正。原来的服务接口仍然保留，可作为备用方式手动
+指定地图和六自由度初值：
 
 设置重定位初始值：
 
@@ -317,6 +372,7 @@ ros2 service call /hba/refine_map interface/srv/RefineMap \
 - [`hku-mars/FAST_LIO`](https://github.com/hku-mars/FAST_LIO)
 - [`hku-mars/BALM`](https://github.com/hku-mars/BALM)
 - [`hku-mars/HBA`](https://github.com/hku-mars/HBA)
+- [`HViktorTsoi/FAST_LIO_LOCALIZATION`](https://github.com/HViktorTsoi/FAST_LIO_LOCALIZATION)
 
 本仓库保留原项目提交历史和各软件包中的许可证文件。修改与再发布时请继续遵守
 对应的开源许可证。

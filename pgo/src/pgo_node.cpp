@@ -27,6 +27,9 @@ struct NodeConfig
     std::string odom_topic = "/lio/odom";
     std::string map_frame = "map";
     std::string local_frame = "lidar";
+    bool save_on_shutdown = false;
+    std::string save_path;
+    bool save_patches = true;
 };
 
 struct NodeState
@@ -72,6 +75,13 @@ public:
         m_node_config.odom_topic = config["odom_topic"].as<std::string>();
         m_node_config.map_frame = config["map_frame"].as<std::string>();
         m_node_config.local_frame = config["local_frame"].as<std::string>();
+        if (config["map_save"])
+        {
+            const YAML::Node map_save = config["map_save"];
+            m_node_config.save_on_shutdown = map_save["save_on_shutdown"].as<bool>(false);
+            m_node_config.save_path = map_save["save_path"].as<std::string>("");
+            m_node_config.save_patches = map_save["save_patches"].as<bool>(true);
+        }
 
         m_pgo_config.key_pose_delta_deg = config["key_pose_delta_deg"].as<double>();
         m_pgo_config.key_pose_delta_trans = config["key_pose_delta_trans"].as<double>();
@@ -81,6 +91,18 @@ public:
         m_pgo_config.loop_submap_half_range = config["loop_submap_half_range"].as<int>();
         m_pgo_config.submap_resolution = config["submap_resolution"].as<double>();
         m_pgo_config.min_loop_detect_duration = config["min_loop_detect_duration"].as<double>();
+    }
+
+    void saveOnShutdown()
+    {
+        if (!m_node_config.save_on_shutdown)
+            return;
+
+        std::string message;
+        if (saveMaps(m_node_config.save_path, m_node_config.save_patches, message))
+            RCLCPP_INFO(this->get_logger(), "AUTO SAVE SUCCESS: %s", m_node_config.save_path.c_str());
+        else
+            RCLCPP_WARN(this->get_logger(), "AUTO SAVE SKIPPED: %s", message.c_str());
     }
     void syncCB(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &cloud_msg, const nav_msgs::msg::Odometry::ConstSharedPtr &odom_msg)
     {
@@ -222,66 +244,87 @@ public:
 
     void saveMapsCB(const std::shared_ptr<interface::srv::SaveMaps::Request> request, std::shared_ptr<interface::srv::SaveMaps::Response> response)
     {
-        if (!std::filesystem::exists(request->file_path))
+        response->success = saveMaps(request->file_path, request->save_patches, response->message);
+    }
+
+    bool saveMaps(const std::string &file_path, bool save_patches, std::string &message)
+    {
+        if (file_path.empty())
         {
-            response->success = false;
-            response->message = request->file_path + " IS NOT EXISTS!";
-            return;
+            message = "SAVE PATH IS EMPTY!";
+            return false;
+        }
+        if (m_pgo->keyPoses().empty())
+        {
+            message = "NO POSES!";
+            return false;
         }
 
-        if (m_pgo->keyPoses().size() == 0)
+        try
         {
-            response->success = false;
-            response->message = "NO POSES!";
-            return;
-        }
+            const std::filesystem::path output_dir(file_path);
+            const std::filesystem::path patches_dir = output_dir / "patches";
+            const std::filesystem::path poses_txt_path = output_dir / "poses.txt";
+            const std::filesystem::path map_path = output_dir / "map.pcd";
+            std::filesystem::create_directories(output_dir);
 
-        std::filesystem::path p_dir(request->file_path);
-        std::filesystem::path patches_dir = p_dir / "patches";
-        std::filesystem::path poses_txt_path = p_dir / "poses.txt";
-        std::filesystem::path map_path = p_dir / "map.pcd";
-
-        if (request->save_patches)
-        {
-            if (std::filesystem::exists(patches_dir))
+            std::ofstream poses_file;
+            if (save_patches)
             {
-                std::filesystem::remove_all(patches_dir);
+                if (std::filesystem::exists(patches_dir))
+                    std::filesystem::remove_all(patches_dir);
+                std::filesystem::create_directories(patches_dir);
+                poses_file.open(poses_txt_path, std::ios::trunc);
+                if (!poses_file.is_open())
+                {
+                    message = "FAILED TO OPEN " + poses_txt_path.string();
+                    return false;
+                }
+                RCLCPP_INFO(this->get_logger(), "Patches Path: %s", patches_dir.string().c_str());
             }
 
-            std::filesystem::create_directories(patches_dir);
-
-            if (std::filesystem::exists(poses_txt_path))
+            RCLCPP_INFO(this->get_logger(), "SAVE MAP TO %s", map_path.string().c_str());
+            CloudType::Ptr map_cloud(new CloudType);
+            for (size_t i = 0; i < m_pgo->keyPoses().size(); ++i)
             {
-                std::filesystem::remove(poses_txt_path);
+                const KeyPoseWithCloud &key_pose = m_pgo->keyPoses()[i];
+                if (save_patches)
+                {
+                    const std::string patch_name = std::to_string(i) + ".pcd";
+                    const std::filesystem::path patch_path = patches_dir / patch_name;
+                    if (pcl::io::savePCDFileBinary(patch_path.string(), *key_pose.body_cloud) < 0)
+                    {
+                        message = "FAILED TO SAVE " + patch_path.string();
+                        return false;
+                    }
+                    const Eigen::Quaterniond q(key_pose.r_global);
+                    const V3D t = key_pose.t_global;
+                    poses_file << patch_name << " " << t.x() << " " << t.y() << " " << t.z() << " "
+                               << q.w() << " " << q.x() << " " << q.y() << " " << q.z() << std::endl;
+                }
+
+                CloudType::Ptr world_cloud(new CloudType);
+                pcl::transformPointCloud(*key_pose.body_cloud, *world_cloud, key_pose.t_global,
+                                         Eigen::Quaterniond(key_pose.r_global));
+                *map_cloud += *world_cloud;
             }
-            RCLCPP_INFO(this->get_logger(), "Patches Path: %s", patches_dir.string().c_str());
+
+            if (poses_file.is_open())
+                poses_file.close();
+            if (pcl::io::savePCDFileBinary(map_path.string(), *map_cloud) < 0)
+            {
+                message = "FAILED TO SAVE " + map_path.string();
+                return false;
+            }
         }
-        RCLCPP_INFO(this->get_logger(), "SAVE MAP TO %s", map_path.string().c_str());
-
-        std::ofstream txt_file(poses_txt_path);
-
-        CloudType::Ptr ret(new CloudType);
-        for (size_t i = 0; i < m_pgo->keyPoses().size(); i++)
+        catch (const std::exception &e)
         {
-
-            CloudType::Ptr body_cloud = m_pgo->keyPoses()[i].body_cloud;
-            if (request->save_patches)
-            {
-                std::string patch_name = std::to_string(i) + ".pcd";
-                std::filesystem::path patch_path = patches_dir / patch_name;
-                pcl::io::savePCDFileBinary(patch_path.string(), *body_cloud);
-                Eigen::Quaterniond q(m_pgo->keyPoses()[i].r_global);
-                V3D t = m_pgo->keyPoses()[i].t_global;
-                txt_file << patch_name << " " << t.x() << " " << t.y() << " " << t.z() << " " << q.w() << " " << q.x() << " " << q.y() << " " << q.z() << std::endl;
-            }
-            CloudType::Ptr world_cloud(new CloudType);
-            pcl::transformPointCloud(*body_cloud, *world_cloud, m_pgo->keyPoses()[i].t_global, Eigen::Quaterniond(m_pgo->keyPoses()[i].r_global));
-            *ret += *world_cloud;
+            message = e.what();
+            return false;
         }
-        txt_file.close();
-        pcl::io::savePCDFileBinary(map_path.string(), *ret);
-        response->success = true;
-        response->message = "SAVE SUCCESS!";
+
+        message = "SAVE SUCCESS!";
+        return true;
     }
 
 private:
@@ -301,7 +344,10 @@ private:
 int main(int argc, char **argv)
 {
     rclcpp::init(argc, argv);
-    rclcpp::spin(std::make_shared<PGONode>());
+    auto node = std::make_shared<PGONode>();
+    rclcpp::spin(node);
+    node->saveOnShutdown();
+    node.reset();
     rclcpp::shutdown();
     return 0;
 }

@@ -11,3 +11,10 @@ loop_score_tresh: 0.15
 loop_submap_half_range: 5
 submap_resolution: 0.1
 min_loop_detect_duration: 5.0
+
+# 正常使用 Ctrl+C 结束 pgo_node 时，自动保存当前 PGO 优化地图。
+# 保存目录不存在时会自动创建；仍可通过 /pgo/save_maps 服务随时手动保存。
+map_save:
+  save_on_shutdown: true
+  save_path: /home/lin/fastlio2_pgo_ws/src/FASTLIO2_ROS2_PGO/pgo/maps
+  save_patches: false
