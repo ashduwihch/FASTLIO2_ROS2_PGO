@@ -1,5 +1,6 @@
 #include <rclcpp/rclcpp.hpp>
 #include <nav_msgs/msg/odometry.hpp>
+#include <nav_msgs/msg/path.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/point.hpp>
@@ -51,6 +52,10 @@ public:
         m_cloud_sub.subscribe(this, m_node_config.cloud_topic, qos.get_rmw_qos_profile());
         m_odom_sub.subscribe(this, m_node_config.odom_topic, qos.get_rmw_qos_profile());
         m_loop_marker_pub = this->create_publisher<visualization_msgs::msg::MarkerArray>("/pgo/loop_markers", 10000);
+        rclcpp::QoS path_qos(1);
+        path_qos.reliable().transient_local();
+        m_raw_path_pub = this->create_publisher<nav_msgs::msg::Path>("/pgo/path_before", path_qos);
+        m_optimized_path_pub = this->create_publisher<nav_msgs::msg::Path>("/pgo/path_optimized", path_qos);
         m_tf_broadcaster = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
         m_sync = std::make_shared<message_filters::Synchronizer<message_filters::sync_policies::ApproximateTime<sensor_msgs::msg::PointCloud2, nav_msgs::msg::Odometry>>>(message_filters::sync_policies::ApproximateTime<sensor_msgs::msg::PointCloud2, nav_msgs::msg::Odometry>(10), m_cloud_sub, m_odom_sub);
         m_sync->setAgePenalty(0.1);
@@ -210,6 +215,67 @@ public:
         m_loop_marker_pub->publish(marker_array);
     }
 
+    void publishOptimizationPaths(const builtin_interfaces::msg::Time &time)
+    {
+        if (m_raw_path_pub->get_subscription_count() == 0 &&
+            m_optimized_path_pub->get_subscription_count() == 0)
+            return;
+
+        nav_msgs::msg::Path raw_path;
+        nav_msgs::msg::Path optimized_path;
+        raw_path.header.frame_id = m_node_config.map_frame;
+        raw_path.header.stamp = time;
+        optimized_path.header = raw_path.header;
+
+        const auto &poses = m_pgo->keyPoses();
+        raw_path.poses.reserve(poses.size());
+        optimized_path.poses.reserve(poses.size());
+        for (const auto &key_pose : poses)
+        {
+            geometry_msgs::msg::PoseStamped raw_pose;
+            raw_pose.header = raw_path.header;
+            raw_pose.pose.position.x = key_pose.t_local.x();
+            raw_pose.pose.position.y = key_pose.t_local.y();
+            raw_pose.pose.position.z = key_pose.t_local.z();
+            const Eigen::Quaterniond raw_q(key_pose.r_local);
+            raw_pose.pose.orientation.x = raw_q.x();
+            raw_pose.pose.orientation.y = raw_q.y();
+            raw_pose.pose.orientation.z = raw_q.z();
+            raw_pose.pose.orientation.w = raw_q.w();
+            raw_path.poses.push_back(raw_pose);
+
+            geometry_msgs::msg::PoseStamped optimized_pose;
+            optimized_pose.header = optimized_path.header;
+            optimized_pose.pose.position.x = key_pose.t_global.x();
+            optimized_pose.pose.position.y = key_pose.t_global.y();
+            optimized_pose.pose.position.z = key_pose.t_global.z();
+            const Eigen::Quaterniond optimized_q(key_pose.r_global);
+            optimized_pose.pose.orientation.x = optimized_q.x();
+            optimized_pose.pose.orientation.y = optimized_q.y();
+            optimized_pose.pose.orientation.z = optimized_q.z();
+            optimized_pose.pose.orientation.w = optimized_q.w();
+            optimized_path.poses.push_back(optimized_pose);
+        }
+
+        m_raw_path_pub->publish(raw_path);
+        m_optimized_path_pub->publish(optimized_path);
+    }
+
+    std::pair<double, double> loopResidual(const LoopPair &loop) const
+    {
+        const auto &poses = m_pgo->keyPoses();
+        const auto &source = poses.at(loop.source_id);
+        const auto &target = poses.at(loop.target_id);
+        const M3D predicted_r = target.r_global.transpose() * source.r_global;
+        const V3D predicted_t = target.r_global.transpose() *
+                                (source.t_global - target.t_global);
+        const double translation_residual = (predicted_t - loop.t_offset).norm();
+        const double rotation_residual =
+            Eigen::Quaterniond(predicted_r).angularDistance(Eigen::Quaterniond(loop.r_offset)) *
+            57.29577951308232;
+        return {translation_residual, rotation_residual};
+    }
+
     void timerCB()
     {
         if (m_state.cloud_buffer.size() == 0)
@@ -233,12 +299,49 @@ public:
             return;
         }
 
+        const size_t loops_before = m_pgo->loopPairs().size();
         m_pgo->searchForLoopPairs();
+        const bool new_loop = m_pgo->loopPairs().size() > loops_before;
+
+        std::pair<double, double> residual_before{0.0, 0.0};
+        V3D source_position_before = V3D::Zero();
+        M3D source_rotation_before = M3D::Identity();
+        if (new_loop)
+        {
+            const LoopPair &loop = m_pgo->loopPairs().back();
+            residual_before = loopResidual(loop);
+            source_position_before = m_pgo->keyPoses().at(loop.source_id).t_global;
+            source_rotation_before = m_pgo->keyPoses().at(loop.source_id).r_global;
+        }
 
         m_pgo->smoothAndUpdate();
 
+        if (new_loop)
+        {
+            const LoopPair &loop = m_pgo->loopPairs().back();
+            const auto residual_after = loopResidual(loop);
+            const auto &source_after = m_pgo->keyPoses().at(loop.source_id);
+            const double correction_translation =
+                (source_after.t_global - source_position_before).norm();
+            const double correction_rotation =
+                Eigen::Quaterniond(source_rotation_before)
+                    .angularDistance(Eigen::Quaterniond(source_after.r_global)) *
+                57.29577951308232;
+            RCLCPP_WARN(
+                this->get_logger(),
+                "LOOP ACCEPTED source=%zu target=%zu score=%.6f | constraint residual: "
+                "%.3f m / %.2f deg -> %.3f m / %.2f deg | source correction: "
+                "%.3f m / %.2f deg | loops=%zu",
+                loop.source_id, loop.target_id, loop.score,
+                residual_before.first, residual_before.second,
+                residual_after.first, residual_after.second,
+                correction_translation, correction_rotation,
+                m_pgo->loopPairs().size());
+        }
+
         sendBroadCastTF(cur_time);
 
+        publishOptimizationPaths(cur_time);
         publishLoopMarkers(cur_time);
     }
 
@@ -334,6 +437,8 @@ private:
     std::shared_ptr<SimplePGO> m_pgo;
     rclcpp::TimerBase::SharedPtr m_timer;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr m_loop_marker_pub;
+    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr m_raw_path_pub;
+    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr m_optimized_path_pub;
     rclcpp::Service<interface::srv::SaveMaps>::SharedPtr m_save_map_srv;
     message_filters::Subscriber<sensor_msgs::msg::PointCloud2> m_cloud_sub;
     message_filters::Subscriber<nav_msgs::msg::Odometry> m_odom_sub;

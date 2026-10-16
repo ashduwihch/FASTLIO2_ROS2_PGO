@@ -165,6 +165,7 @@ void SimplePGO::searchForLoopPairs()
     one_pair.r_offset = m_key_poses[loop_idx].r_global.transpose() * r_refined;
     one_pair.t_offset = m_key_poses[loop_idx].r_global.transpose() * (t_refined - m_key_poses[loop_idx].t_global);
     m_cache_pairs.push_back(one_pair);
+    m_loop_pairs.push_back(one_pair);
     m_history_pairs.emplace_back(one_pair.target_id, one_pair.source_id);
 }
 

@@ -1,174 +1,143 @@
 #include "hba.h"
-HBA::HBA(const HBAConfig config) : m_config(config)
+
+#include <fstream>
+#include <iostream>
+#include <stdexcept>
+
+#include <pcl/common/transforms.h>
+
+#include "official/official_hierarchy.hpp"
+
+using OfficialPoint = PointType;
+
+static void official_transform_pointcloud(
+    const pcl::PointCloud<OfficialPoint> &input,
+    pcl::PointCloud<OfficialPoint> &output,
+    const Eigen::Vector3d &translation,
+    const Eigen::Quaterniond &rotation)
 {
-    m_poses.clear();
-    m_clouds.clear();
-    m_lbas.clear();
+    output.resize(input.size());
+    for (size_t i = 0; i < input.size(); ++i)
+    {
+        const Eigen::Vector3d point(input[i].x, input[i].y, input[i].z);
+        const Eigen::Vector3d transformed = rotation * point + translation;
+        output[i].x = static_cast<float>(transformed.x());
+        output[i].y = static_cast<float>(transformed.y());
+        output[i].z = static_cast<float>(transformed.z());
+    }
 }
+
+static pcl::PointCloud<OfficialPoint>::Ptr official_append_cloud(
+    pcl::PointCloud<OfficialPoint>::Ptr destination,
+    const pcl::PointCloud<OfficialPoint> &source)
+{
+    *destination += source;
+    return destination;
+}
+
+// This is the official hku-mars/HBA computation flow with only ROS1 timing,
+// file I/O and point-cloud plumbing adapted for the ROS2 in-memory wrapper.
+#include "official/official_core.inc"
+
+struct HBA::Impl
+{
+};
+
+HBA::HBA(const HBAConfig &config)
+    : m_impl(std::make_unique<Impl>()), m_config(config)
+{
+}
+
+HBA::~HBA() = default;
+
 void HBA::insert(pcl::PointCloud<pcl::PointXYZI>::Ptr &cloud, const Pose &pose)
 {
     m_clouds.push_back(cloud);
     m_poses.push_back(pose);
 }
+
 void HBA::optimize()
 {
-    m_levels = calcLevels();
-    gtsam::Values initial_estimates;
-    gtsam::LevenbergMarquardtParams lm_params;
-    gtsam::NonlinearFactorGraph graph;
+    if (m_poses.size() != m_clouds.size())
+        throw std::runtime_error("HBA pose/cloud count mismatch");
+    if (m_poses.size() < WIN_SIZE)
+        throw std::runtime_error("HBA requires at least WIN_SIZE keyframes");
 
-    // for (size_t i = 0; i < m_config.hba_iter; i++)
-    // {
-    Vec<Vec<BLAM>>().swap(m_lbas);
-    m_lbas.resize(m_levels, Vec<BLAM>());
-    Vec<pcl::PointCloud<pcl::PointXYZI>::Ptr> clouds = m_clouds;
-    Vec<Pose> poses = m_poses;
-    initial_estimates.clear();
-    graph.resize(0);
-    // 设置初始值
+    std::vector<official_hba_types::Pose> official_poses(m_poses.size());
+    std::vector<pcl::PointCloud<OfficialPoint>::Ptr> official_clouds(m_clouds.size());
 
-    std::cout << "INIT POSE ESTIMATE" << std::endl;
-    for (size_t j = 0; j < m_poses.size(); j++)
+    for (size_t i = 0; i < m_poses.size(); ++i)
     {
-        initial_estimates.insert(j, gtsam::Pose3(gtsam::Rot3(poses[j].r), gtsam::Point3(poses[j].t)));
-    }
+        official_poses[i].q = Eigen::Quaterniond(m_poses[i].r);
+        official_poses[i].t = m_poses[i].t;
 
-    for (int level = 0; level < m_levels; level++)
-    {
-        constructHierarchy(clouds, poses, level);
-        std::cout << "LBA OPTIMIZE LEVEL: " << level << std::endl;
-
-        updateCloudsAndPose(clouds, poses, level);
-    }
-    Vec<std::pair<size_t, size_t>> between_factors_id;
-    Vec<Pose> between_factors_pose;
-    Vec<M6D> between_factors_info;
-    getAllFactors(between_factors_id, between_factors_pose, between_factors_info);
-    // 添加二元因子
-
-    std::cout << "CONSTRUCT BETWEEN FACTORS" << std::endl;
-    for (size_t j = 0; j < between_factors_id.size(); j++)
-    {
-        gtsam::BetweenFactor<gtsam::Pose3> between_factor(between_factors_id[j].first,
-                                                          between_factors_id[j].second,
-                                                          gtsam::Pose3(gtsam::Rot3(between_factors_pose[j].r), gtsam::Point3(between_factors_pose[j].t)),
-                                                          gtsam::noiseModel::Gaussian::Information(between_factors_info[j]));
-        graph.add(between_factor);
-    }
-    // 优化
-    gtsam::LevenbergMarquardtOptimizer optimizer(graph, initial_estimates, lm_params);
-
-    std::cout << "LM OPTIMIZE " << std::endl;
-    gtsam::Values result = optimizer.optimize();
-    // 更新位姿
-    std::cout << "UPDATE POSE ESTIMATE" << std::endl;
-    for (size_t j = 0; j < m_poses.size(); j++)
-    {
-        gtsam::Pose3 pose = result.at<gtsam::Pose3>(j);
-        m_poses[j].t = pose.translation().matrix().cast<double>();
-        m_poses[j].r = pose.rotation().matrix().cast<double>();
-    }
-    // }
-}
-void HBA::updateCloudsAndPose(Vec<pcl::PointCloud<pcl::PointXYZI>::Ptr> &clouds, Vec<Pose> &poses, int level)
-{
-    Vec<pcl::PointCloud<pcl::PointXYZI>::Ptr>().swap(clouds);
-    Vec<Pose>().swap(poses);
-    for (BLAM &lba : m_lbas[level])
-    {
-        poses.push_back(lba.poses()[0]);
-        pcl::PointCloud<pcl::PointXYZI>::Ptr cloud = lba.getLocalCloud();
-        if (m_config.down_sample > 0.0)
+        auto cloud = std::make_shared<pcl::PointCloud<OfficialPoint>>();
+        cloud->resize(m_clouds[i]->size());
+        for (size_t j = 0; j < m_clouds[i]->size(); ++j)
         {
-            pcl::VoxelGrid<pcl::PointXYZI> voxel_grid;
-            voxel_grid.setLeafSize(m_config.down_sample, m_config.down_sample, m_config.down_sample);
-            voxel_grid.setInputCloud(cloud);
-            voxel_grid.filter(*cloud);
+            (*cloud)[j].x = (*m_clouds[i])[j].x;
+            (*cloud)[j].y = (*m_clouds[i])[j].y;
+            (*cloud)[j].z = (*m_clouds[i])[j].z;
         }
-        clouds.push_back(cloud);
+        official_clouds[i] = cloud;
     }
-}
-void HBA::constructHierarchy(Vec<pcl::PointCloud<pcl::PointXYZI>::Ptr> &clouds, Vec<Pose> &poses, int level)
-{
-    BLAMConfig config;
-    config.voxel_size = m_config.voxel_size;
-    config.max_iter = m_config.ba_max_iter;
-    config.max_layer = m_config.max_layer;
-    config.min_point_num = m_config.min_point_num;
-    for (size_t i = 0; i < clouds.size(); i += m_config.stride)
-    {
-        m_lbas[level].emplace_back(config);
-        bool drop_last = false;
-        for (int j = 0; j < m_config.window_size; j++)
-        {
-            size_t idx = i + j;
-            if (i + j >= clouds.size())
-            {
-                drop_last = true;
-                break;
-            }
-            m_lbas[level].back().insert(clouds[idx], poses[idx]);
-        }
-        // std::cout << "level: " << level << " window: " << i << std::endl;
-        m_lbas[level].back().optimize();
-        if (drop_last)
-            break;
-    }
-}
-void HBA::getAllFactors(Vec<std::pair<size_t, size_t>> &ids, Vec<Pose> &poses, Vec<M6D> &infos)
-{
-    for (size_t level_idx = 0; level_idx < static_cast<size_t>(m_levels); level_idx++)
-    {
-        for (size_t stride_idx = 0; stride_idx < m_lbas[level_idx].size(); stride_idx++)
-        {
-            BLAM &blam = m_lbas[level_idx][stride_idx];
-            for (size_t pose_idx = 0; pose_idx < blam.poses().size() - 1; pose_idx++)
-            {
-                size_t from = pose_idx + stride_idx * m_config.stride;
-                size_t to = pose_idx + 1 + stride_idx * m_config.stride;
-                from = from * std::pow(m_config.stride, level_idx);
-                to = to * std::pow(m_config.stride, level_idx);
-                ids.emplace_back(std::make_pair(from, to));
-                Pose &pose_from = blam.poses()[pose_idx];
-                Pose &pose_to = blam.poses()[pose_idx + 1];
-                Pose pose_fc;
-                pose_fc.r = pose_from.r.transpose() * pose_to.r;
-                pose_fc.t = pose_from.r.transpose() * (pose_to.t - pose_from.t);
-                // std::cout << "level: " << level_idx << " from: " << from << " to: " << to << std::endl;
-                poses.push_back(pose_fc);
-                infos.push_back(blam.H().block<6, 6>(6 * pose_idx, 6 * (pose_idx + 1)));
-            }
-        }
-    }
-}
-int HBA::calcLevels()
-{
 
-    assert(m_poses.size() > 0 && m_config.window_size > 0 && m_config.stride > 0);
-    return static_cast<int>(0.5 * std::log(3.0 * std::pow(static_cast<double>(m_poses.size()), 2) * (std::pow(m_config.stride, 3) - m_config.stride) / std::pow(static_cast<double>(m_config.window_size), 3)) / std::log(m_config.stride));
+    OfficialHierarchy hierarchy(
+        m_config.total_layer_num,
+        m_config.thread_num,
+        official_poses,
+        official_clouds,
+        m_config.down_sample,
+        m_config.voxel_size,
+        m_config.eigen_ratio,
+        m_config.reject_ratio,
+        m_config.max_iter);
+
+    for (int level = 0; level < m_config.total_layer_num - 1; ++level)
+    {
+        std::cout << "---------------------\nOFFICIAL HBA LAYER " << level + 1 << std::endl;
+        distribute_thread(hierarchy.layers[level], hierarchy.layers[level + 1]);
+        hierarchy.update_next_layer_state(level);
+    }
+
+    std::cout << "---------------------\nOFFICIAL HBA GLOBAL BA" << std::endl;
+    global_ba(hierarchy.layers[m_config.total_layer_num - 1]);
+    hierarchy.pose_graph_optimization();
+
+    const auto &optimized = hierarchy.layers[0].pose_vec;
+    if (optimized.size() != m_poses.size())
+        throw std::runtime_error("Official HBA returned an unexpected pose count");
+
+    for (size_t i = 0; i < optimized.size(); ++i)
+    {
+        m_poses[i].r = optimized[i].q.normalized().toRotationMatrix();
+        m_poses[i].t = optimized[i].t;
+    }
 }
+
 pcl::PointCloud<pcl::PointXYZI>::Ptr HBA::getMapPoints()
 {
-    pcl::PointCloud<pcl::PointXYZI>::Ptr ret(new pcl::PointCloud<pcl::PointXYZI>);
-    for (size_t i = 0; i < m_poses.size(); i++)
+    auto map = std::make_shared<pcl::PointCloud<pcl::PointXYZI>>();
+    for (size_t i = 0; i < m_poses.size(); ++i)
     {
-        Pose &pose = m_poses[i];
-        pcl::PointCloud<pcl::PointXYZI>::Ptr cloud = m_clouds[i];
-        pcl::PointCloud<pcl::PointXYZI>::Ptr transformed(new pcl::PointCloud<pcl::PointXYZI>);
-        pcl::transformPointCloud(*cloud, *transformed, pose.t, Eigen::Quaterniond(pose.r));
-        *ret += *transformed;
+        auto transformed = std::make_shared<pcl::PointCloud<pcl::PointXYZI>>();
+        pcl::transformPointCloud(
+            *m_clouds[i], *transformed, m_poses[i].t, Eigen::Quaterniond(m_poses[i].r));
+        *map += *transformed;
     }
-    return ret;
+    return map;
 }
+
 void HBA::writePoses(const std::string &path)
 {
-    std::ofstream txt_file(path);
-    for (size_t i = 0; i < m_poses.size(); i++)
+    std::ofstream output(path, std::ios::trunc);
+    if (!output.is_open())
+        throw std::runtime_error("Failed to open HBA pose output: " + path);
+
+    for (const Pose &pose : m_poses)
     {
-        Pose &pose = m_poses[i];
-        V3D t = pose.t;
-        Eigen::Quaterniond q(pose.r);
-        txt_file << t.x() << " " << t.y() << " " << t.z() << " " << q.w() << " " << q.x() << " " << q.y() << " " << q.z() << std::endl;
+        const Eigen::Quaterniond q(pose.r);
+        output << pose.t.x() << " " << pose.t.y() << " " << pose.t.z() << " "
+               << q.w() << " " << q.x() << " " << q.y() << " " << q.z() << "\n";
     }
-    txt_file.close();
 }

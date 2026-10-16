@@ -17,4 +17,4 @@ min_loop_detect_duration: 5.0
 map_save:
   save_on_shutdown: true
   save_path: /home/lin/fastlio2_pgo_ws/src/FASTLIO2_ROS2_PGO/pgo/maps
-  save_patches: false
+  save_patches: true

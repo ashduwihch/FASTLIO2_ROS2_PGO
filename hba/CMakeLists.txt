@@ -21,6 +21,7 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(visualization_msgs REQUIRED)
 find_package(interface REQUIRED)
 find_package(pcl_conversions REQUIRED)
 
@@ -30,7 +31,6 @@ find_package(Eigen3 REQUIRED)
 find_package(PCL REQUIRED)
 find_package(yaml-cpp REQUIRED)
 find_package(OpenMP QUIET)
-find_package(Sophus REQUIRED)
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS}   ${OpenMP_C_FLAGS}")
@@ -40,13 +40,11 @@ include_directories(
   ${PCL_INCLUDE_DIRS}
 )
 
-set(SRC_LIST src/hba/commons.cpp
-             src/hba/blam.cpp
-             src/hba/hba.cpp)
+set(SRC_LIST src/hba/hba.cpp)
 
 add_executable(hba_node src/hba_node.cpp ${SRC_LIST})
-ament_target_dependencies(hba_node rclcpp std_msgs sensor_msgs interface pcl_conversions GTSAM)
-target_link_libraries(hba_node ${PCL_LIBRARIES} gtsam yaml-cpp Sophus::Sophus)
+ament_target_dependencies(hba_node rclcpp std_msgs sensor_msgs visualization_msgs interface pcl_conversions GTSAM)
+target_link_libraries(hba_node ${PCL_LIBRARIES} gtsam yaml-cpp)
 
 install(TARGETS hba_node DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY launch DESTINATION share/${PROJECT_NAME})

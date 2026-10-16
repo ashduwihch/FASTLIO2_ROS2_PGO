@@ -1,11 +1,15 @@
 scan_resolution: 0.1
 
-window_size: 20
-stride: 10
-voxel_size: 0.5
-min_point_num: 10
-max_layer: 3
-plane_thresh: 0.01
-ba_max_iter: 10
-hba_iter: 5
+# RViz-only visualization. These values do not change HBA optimization.
+correction_display_scale: 10.0
+max_correction_arrows: 100
+correction_marker_size: 0.12
+
+# Official hku-mars/HBA defaults.
+total_layer_num: 3
+thread_num: 16
+max_iter: 10
 down_sample: 0.1
+voxel_size: 4.0
+eigen_ratio: 0.1
+reject_ratio: 0.05

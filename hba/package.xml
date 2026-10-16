@@ -3,9 +3,9 @@
 <package format="3">
   <name>hba</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <description>ROS 2 integration of the official hku-mars Hierarchical Bundle Adjustment core.</description>
   <maintainer email="2605400720@qq.com">liangheming</maintainer>
-  <license>MIT</license>
+  <license>GPL-2.0-only</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
 
@@ -13,6 +13,7 @@
   <depend>std_msgs</depend>
   <depend>GTSAM</depend>
   <depend>sensor_msgs</depend>
+  <depend>visualization_msgs</depend>
   <depend>interface</depend>
   <depend>pcl_conversions</depend>
 

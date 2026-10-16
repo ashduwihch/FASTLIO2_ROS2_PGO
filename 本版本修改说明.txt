@@ -25,21 +25,31 @@ Gazebo 启动、暂停、场景切换或当前扫描没有有效命中时，可�
 
 修改文件：fastlio2/src/lio_node.cpp
 
-三、补充 Sophus 链接
+三、补充 FAST-LIO2 的 Sophus 链接
 
-在 fastlio2 和 HBA 的 CMake 配置中显式链接 Sophus::Sophus，解决部分环境下
-已经找到 Sophus、但编译时仍提示 sophus/so3.hpp 不存在或链接不完整的问题。
-该修改不影响 FAST-LIO2 或 HBA 算法。
+在 fastlio2 的 CMake 配置中显式链接 Sophus::Sophus，解决部分环境下已经找到
+Sophus、但编译时仍提示 sophus/so3.hpp 不存在或链接不完整的问题。
+该修改不影响 FAST-LIO2 算法。
 
 修改文件：fastlio2/CMakeLists.txt、hba/CMakeLists.txt
 
-四、调整 PGO 的 RViz 默认显示
+四、增加 PGO 保存与优化效果展示
 
 累计 world_cloud 长时间显示时会不断增加 RViz 的渲染负担。当前配置默认关闭
-world_cloud 和路径显示，并增加 /fastlio2/lio_odom 里程计箭头。用户仍可在
-RViz 中按需重新启用世界点云和路径。
+world_cloud，并增加回环约束、优化前轨迹、优化后轨迹和回环修正统计。PGO 支持
+正常退出时自动保存 map.pcd、poses.txt 和供 HBA 使用的 patches。
 
 修改文件：pgo/rviz/pgo.rviz
 
-以上修改不改变 FAST-LIO2 的点云匹配、IESKF、PGO 回环检测、GTSAM 位姿图优化、
-重定位或 HBA 算法逻辑。
+五、移植 FAST_LIO_LOCALIZATION 重定位流程
+
+重定位模块按照 HViktorTsoi/FAST_LIO_LOCALIZATION 的工作方式移植到 ROS 2，支持
+RViz 2D Pose Estimate 初值、粗到细 Open3D ICP、匹配分数输出和持续 scan-to-map
+校正，并复用当前 FAST-LIO2 与 MID-360 数据链路。
+
+六、替换为官方 HBA 优化核心
+
+HBA 模块替换为 hku-mars/HBA 的 ROS 2 移植核心，保留官方分层 LiDAR BA 与位姿图
+平滑流程。程序读取 PGO 保存的 poses.txt 和 patches，输出优化前后地图及优化后
+位姿，并增加结果统计、异常结果保护、红绿轨迹、修正量彩球和放大修正箭头。
+官方 HBA 源码许可证保存在 hba/LICENSE_HKU_MARS_HBA。

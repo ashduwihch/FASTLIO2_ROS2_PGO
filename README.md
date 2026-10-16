@@ -6,10 +6,10 @@
 - FAST-LIO2 激光惯性里程计；
 - 基于位置先验、ICP 与 GTSAM 的 PGO 回环优化；
 - 基于粗到细 ICP 的重定位；
-- 基于 BALM / HBA 的一致性地图优化。
+- 基于官方 HBA 的一致性地图优化。
 
 当前版本针对 Gazebo Harmonic MID-360 仿真补充了 IMU 单位修正、空点云保护、
-Sophus 链接兼容和 RViz 显示优化，可直接配合
+FAST-LIO2 的 Sophus 链接兼容和 RViz 显示优化，可直接配合
 [`ashduwihch/mid360_gazebo_harmonic`](https://github.com/ashduwihch/mid360_gazebo_harmonic)
 使用。
 
@@ -17,6 +17,7 @@ Sophus 链接兼容和 RViz 显示优化，可直接配合
 
 | 版本 | 日期 | 主要变化 |
 | --- | --- | --- |
+| `v0.3.0` | 2026-10-16 | 将 HBA 替换为官方 `hku-mars/HBA` 的 ROS 2 移植核心，增加优化前后地图、轨迹、修正向量可视化、结果统计和异常结果保护；PGO 增加回环前后轨迹与约束修正效果展示。 |
 | `v0.2.0` | 2026-10-13 | PGO 支持退出时自动保存优化地图；将重定位更新为 ROS 2 移植版 FAST_LIO_LOCALIZATION，支持 RViz `2D Pose Estimate` 初值、粗到细 Open3D ICP、匹配分数输出和持续 scan-to-map 校正。 |
 | `v0.1.0` | 2026-09-27 | 完成 Ubuntu 22.04、ROS 2 Humble 与 Gazebo Harmonic MID-360 仿真适配。 |
 
@@ -78,8 +79,8 @@ Gazebo 启动、暂停、场景切换或雷达没有有效命中时，可能产�
 
 ### 3. 补充 Sophus 链接目标
 
-在 FAST-LIO2 与 HBA 的构建配置中显式链接 `Sophus::Sophus`，解决已经找到
-Sophus、但编译时仍提示 `sophus/so3.hpp` 不存在的问题。该修改不改变算法。
+在 FAST-LIO2 的构建配置中显式链接 `Sophus::Sophus`，解决已经找到 Sophus、
+但编译时仍提示 `sophus/so3.hpp` 不存在的问题。该修改不改变算法。
 
 ### 4. 优化 PGO 的 RViz 默认显示
 
@@ -353,6 +354,10 @@ ros2 service call /localizer/relocalize interface/srv/Relocalize \
 
 ## HBA 一致性地图优化
 
+本包的优化核心移植自官方 [`hku-mars/HBA`](https://github.com/hku-mars/HBA)，
+保留官方三层层级 BA、窗口内完整约束、异常平面剔除、首帧先验和 GTSAM ISAM2
+位姿图优化；ROS 2 服务接口和 PGO 的 `poses.txt + patches/` 输入格式保持不变。
+
 ```bash
 ros2 launch hba hba_launch.py
 ```
@@ -365,6 +370,24 @@ ros2 service call /hba/refine_map interface/srv/RefineMap \
 ```
 
 使用 HBA 时，保存地图需设置 `save_patches: true`。
+
+优化结束后会在传入的地图目录中自动生成：
+
+- `map_before_hba.pcd`：HBA 优化前地图；
+- `map_after_hba.pcd`：HBA 优化后地图；
+- `hba_poses.txt`：HBA 优化后的关键帧位姿。
+
+HBA 的 RViz 同时显示红色优化前地图和绿色优化后地图，并通过
+`/hba/optimization_visualization` 显示红色优化前轨迹、绿色优化后轨迹、关键帧
+修正量彩球以及修正方向箭头。箭头长度默认放大 10 倍，只用于帮助观察，不改变
+优化结果；彩球由青色、黄色到红色表示本次优化中由小到大的相对修正量。
+
+放大墙面、门框、立柱和重复扫描区域，可以观察优化后墙面厚度、双层边缘和重影
+是否减小。终端还会输出关键帧位姿的平均/最大平移修正量和旋转修正量；这些数值
+表示 HBA 改动了多少，不等同于相对于真值的定位误差。
+
+优化结果保存前还会检查相邻关键帧是否发生异常平移或旋转跳变。检查失败时会拒绝
+结果、恢复原始位姿，并且不写出 `map_after_hba.pcd` 和 `hba_poses.txt`。
 
 ## 项目来源与致谢
 
